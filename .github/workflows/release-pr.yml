@@ -2,7 +2,8 @@ name: Release PR
 
 # Reusable workflow. Opens, or refreshes, the release pull request from the
 # integration branch into the default branch (main or master), with a changelog
-# an OpenAI model writes from the pull requests merged since the last release.
+# Claude writes from the pull requests merged since the last release. Claude runs
+# on the Claude subscription of whoever made the token: no API key, no other bill.
 #
 # A project needs one file, .github/workflows/release-pr.yml:
 #
@@ -16,9 +17,9 @@ name: Release PR
 #     pull-requests: write
 #   jobs:
 #     release-pr:
-#       uses: navark-ai/workflows/.github/workflows/release-pr.yml@v1
+#       uses: navark-ai/workflows/.github/workflows/release-pr.yml@v2
 #       secrets:
-#         OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+#         CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
 #
 # Nothing is written to the repository: the changelog lives in the pull request
 # body, between two markers, and text written outside the markers is kept on
@@ -46,16 +47,16 @@ on:
         type: string
         default: fr
       model:
-        description: OpenAI model that writes the changelog.
+        description: Claude model that writes the changelog, as an alias (sonnet, opus, haiku) or a full model name.
         type: string
-        default: gpt-6-luna
+        default: sonnet
       dry_run:
         description: Write the pull request body to the run summary and create or change nothing.
         type: boolean
         default: false
     secrets:
-      OPENAI_API_KEY:
-        description: OpenAI API key. Without it the pull request lists the merged pull requests as they are.
+      CLAUDE_CODE_OAUTH_TOKEN:
+        description: Token of a Claude subscription, made with `claude setup-token`. Without it the pull request lists the merged pull requests as they are.
         required: false
 
 jobs:
@@ -88,7 +89,7 @@ jobs:
           LANGUAGE: ${{ inputs.language }}
           MODEL: ${{ inputs.model }}
           DRY_RUN: ${{ inputs.dry_run }}
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
         run: |
           set -euo pipefail
 
@@ -164,8 +165,8 @@ jobs:
           # --- Changelog --------------------------------------------------
 
           : > "$work/changelog.md"
-          if [ -z "${OPENAI_API_KEY:-}" ]; then
-            echo "::warning::OPENAI_API_KEY is not set: the pull request lists the merged pull requests as they are."
+          if [ -z "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]; then
+            echo "::warning::CLAUDE_CODE_OAUTH_TOKEN is not set: the pull request lists the merged pull requests as they are."
           else
             jq -n --slurpfile prs "$work/prs.jsonl" --rawfile commits "$work/commits.txt" \
               '{pull_requests: $prs, commits: ($commits | split("\n") | map(select(length > 0)))}' \
@@ -185,22 +186,31 @@ jobs:
           EOF
             )"
 
-            jq -n --arg model "$MODEL" --arg instructions "$instructions" --rawfile input "$work/input.json" \
-              '{model: $model, instructions: $instructions, input: $input}' > "$work/request.json"
+            # Claude Code in print mode, signed in by CLAUDE_CODE_OAUTH_TOKEN. It gets no tool, no MCP
+            # server, no setting and no skill, and it starts in an empty folder, so it reads no file of
+            # the project: all it can do with the input is write text.
+            mkdir "$work/empty"
+            status=0
+            if ! command -v claude > /dev/null; then
+              npm install --global --no-fund --no-audit @anthropic-ai/claude-code > "$work/claude.log" 2>&1 || status=$?
+            fi
+            if [ "$status" -eq 0 ]; then
+              (
+                cd "$work/empty"
+                timeout 180 claude --print --model "$MODEL" --system-prompt "$instructions" \
+                  --tools "" --strict-mcp-config --setting-sources "" --disable-slash-commands \
+                  --output-format json < "$work/input.json" > "$work/response.json" 2> "$work/claude.log"
+              ) || status=$?
+            fi
 
-            status="$(curl -sS -o "$work/response.json" -w '%{http_code}' --max-time 180 \
-              "${OPENAI_BASE_URL:-https://api.openai.com/v1}/responses" \
-              -H "Authorization: Bearer $OPENAI_API_KEY" \
-              -H "Content-Type: application/json" \
-              --data-binary "@$work/request.json")" || status="000"
-
-            if [ "$status" = "200" ]; then
-              jq -r '[.output[]? | select(.type == "message") | .content[]? | select(.type == "output_text") | .text] | join("")' \
-                "$work/response.json" > "$work/changelog.md" || : > "$work/changelog.md"
+            if [ "$status" -eq 0 ]; then
+              jq -r 'select(.type == "result" and .is_error == false) | .result // ""' \
+                "$work/response.json" > "$work/changelog.md" 2> /dev/null || : > "$work/changelog.md"
             fi
             if ! grep -q '[^[:space:]]' "$work/changelog.md"; then
-              reason="$(jq -r '.error.message // empty' "$work/response.json" 2> /dev/null | tr '\n' ' ' || true)"
-              echo "::warning::OpenAI wrote no changelog (HTTP $status${reason:+: $reason}): the pull request lists the merged pull requests as they are."
+              reason="$(jq -r '.result // empty' "$work/response.json" 2> /dev/null | tr '\n' ' ' | cut -c 1-300 || true)"
+              if [ -z "$reason" ]; then reason="$(tail -n 1 "$work/claude.log" 2> /dev/null | cut -c 1-300 || true)"; fi
+              echo "::warning::Claude wrote no changelog (exit $status${reason:+: $reason}): the pull request lists the merged pull requests as they are."
               : > "$work/changelog.md"
             fi
           fi
